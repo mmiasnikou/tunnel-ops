@@ -1,0 +1,20 @@
+[
+  {
+    "name": "de-fra-01",
+    "addr": "1.2.3.4:443",
+    "sni": "www.microsoft.com",
+    "region": "de"
+  },
+  {
+    "name": "nl-ams-01",
+    "addr": "5.6.7.8:443",
+    "sni": "www.cloudflare.com",
+    "region": "nl"
+  },
+  {
+    "name": "self-test",
+    "addr": "127.0.0.1:1",
+    "sni": "example.com",
+    "region": "local"
+  }
+]

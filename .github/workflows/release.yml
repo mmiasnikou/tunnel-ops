@@ -1,0 +1,91 @@
+name: release
+
+# Triggered by pushing a tag shaped like v1.0.0
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # Discover the list of binaries at runtime so adding cmd/<newtool>/
+  # requires no change to this workflow.
+  discover:
+    name: discover binaries
+    runs-on: ubuntu-latest
+    outputs:
+      cmds: ${{ steps.list.outputs.cmds }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          cmds=$(ls -1 cmd | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "cmds=$cmds" >> "$GITHUB_OUTPUT"
+          echo "found: $cmds"
+
+  build:
+    name: build ${{ matrix.cmd }} ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Three real axes produce a cross product: every binary for every
+      # platform. Note that `include:` would NOT do this — it appends jobs
+      # rather than multiplying them.
+      matrix:
+        cmd: ${{ fromJSON(needs.discover.outputs.cmds) }}
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # windows/arm64 is not a target we ship
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          name="${{ matrix.cmd }}_${GOOS}_${GOARCH}${ext}"
+          # GITHUB_REF_NAME is the tag name; bake it into the binary as version
+          go build \
+            -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" \
+            -trimpath -o "$name" ./cmd/${{ matrix.cmd }}
+          echo "ASSET=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only this job needs write access to the repository, not the whole workflow.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

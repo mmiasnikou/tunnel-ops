@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: lint / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # Check formatting but never fix it: CI must fail loudly rather than
+      # silently commit changes, which would hide the cause.
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "not formatted:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race is mandatory for concurrent code: without it a data race can
+      # stay dormant for years and then surface in production.
+      - name: go test (race)
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: coverage
+        run: go tool cover -func=coverage.out
+
+  # Verify that every binary compiles for every target platform. Cross
+  # compilation errors are caught here rather than at release time.
+  build-matrix:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # ./... covers every cmd/ subdirectory, so a new tool is picked up
+      # automatically with no workflow edit.
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o /dev/null ./...

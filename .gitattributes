@@ -1,0 +1,3 @@
+# Normalise line endings on commit. Makefile in particular breaks with CRLF,
+# and Go tooling expects LF everywhere.
+* text=auto eol=lf
