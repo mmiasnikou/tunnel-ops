@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: probestore
+      POSTGRES_PASSWORD: probestore
+      POSTGRES_DB: probestore
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U probestore"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      PROBESTORE_DATABASE_URL: postgresql+asyncpg://probestore:probestore@db:5432/probestore
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    build: .
+    environment:
+      PROBESTORE_DATABASE_URL: postgresql+asyncpg://probestore:probestore@db:5432/probestore
+      PROBESTORE_API_TOKEN: ${PROBESTORE_API_TOKEN:-change-me}
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
