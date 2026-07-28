@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -46,6 +47,11 @@ type Target struct {
 	Addr   string `json:"addr"`   // host:port, e.g. "1.2.3.4:443"
 	SNI    string `json:"sni"`    // expected masquerade host (Reality)
 	Region string `json:"region"` // monitoring label: "de", "nl"
+
+	// Provider is the hosting vendor ("hetzner", "vultr"). Optional, and
+	// deliberately separate from Region: when a provider starts getting its
+	// ranges filtered, the failures cluster by vendor, not by geography.
+	Provider string `json:"provider,omitempty"`
 }
 
 // Result is the outcome of one probe.
@@ -56,7 +62,18 @@ type Target struct {
 type Result struct {
 	Target
 
-	OK        bool    `json:"ok"`
+	OK bool `json:"ok"`
+
+	// TCPOK and TLSOK record which phases actually succeeded. Without them a
+	// consumer has to guess by string-matching the Error prefix, which breaks
+	// the moment the wording changes.
+	TCPOK bool `json:"tcp_ok"`
+	TLSOK bool `json:"tls_ok"`
+
+	// Timestamp is when the probe finished, in UTC. Set by the caller so
+	// there is exactly one place doing it.
+	Timestamp time.Time `json:"ts"`
+
 	TCPTime   float64 `json:"tcp_seconds"`
 	TLSTime   float64 `json:"tls_seconds"`
 	TLSVer    string  `json:"tls_version,omitempty"` // omitempty: skip when unset
@@ -73,6 +90,20 @@ type Result struct {
 // shared deadline). timeout bounds each phase separately.
 func probe(ctx context.Context, t Target, timeout time.Duration) Result {
 	res := Result{Target: t}
+
+	// Resolve the effective SNI before probing anything. Doing it here rather
+	// than between the phases means a node that fails at TCP is still
+	// reported with the name it would have been probed under — otherwise the
+	// same node shows up under two different identities depending on how far
+	// the probe got.
+	sni := t.SNI
+	if sni == "" {
+		if host, _, splitErr := net.SplitHostPort(t.Addr); splitErr == nil {
+			// The blank identifier _ means "this value is not needed" (the port).
+			sni = host
+		}
+	}
+	res.SNI = sni
 
 	// ---------- Phase 1: TCP ----------
 
@@ -94,17 +125,9 @@ func probe(ctx context.Context, t Target, timeout time.Duration) Result {
 		return res
 	}
 	conn.Close() // the TCP phase is measured; the connection is no longer needed
+	res.TCPOK = true
 
 	// ---------- Phase 2: TLS ----------
-
-	// If no SNI was configured, fall back to the host part of the address.
-	sni := t.SNI
-	if sni == "" {
-		if host, _, splitErr := net.SplitHostPort(t.Addr); splitErr == nil {
-			// The blank identifier _ means "this value is not needed" (the port).
-			sni = host
-		}
-	}
 
 	ctxTLS, cancelTLS := context.WithTimeout(ctx, timeout)
 	defer cancelTLS()
@@ -153,6 +176,7 @@ func probe(ctx context.Context, t Target, timeout time.Duration) Result {
 		res.CertMatch = leaf.VerifyHostname(sni) == nil
 	}
 
+	res.TLSOK = true
 	res.OK = true
 	return res
 }
@@ -185,7 +209,9 @@ func runAll(ctx context.Context, targets []Target, timeout time.Duration, conc i
 			sem <- struct{}{}        // take a permit (blocks when all are held)
 			defer func() { <-sem }() // release it
 
-			out <- probe(ctx, t, timeout)
+			r := probe(ctx, t, timeout)
+			r.Timestamp = time.Now().UTC()
+			out <- r
 		}(t)
 	}
 
@@ -291,7 +317,15 @@ func main() {
 	conc := flag.Int("concurrency", 32, "maximum number of probes running at once")
 	format := flag.String("format", "json", "output format: json | prom")
 	showVer := flag.Bool("version", false, "print the version and exit")
+	pushURL := flag.String("push-url", "", "probestore ingest endpoint, e.g. https://probes.example.com/v1/runs")
+	pushTimeout := flag.Duration("push-timeout", 10*time.Second, "timeout for the push request")
+	pushSource := flag.String("push-source", "", "source label recorded with the run (default: nodecheck@<hostname>)")
 	flag.Parse()
+
+	// The bearer token comes from the environment, never from a flag:
+	// command-line arguments are world-readable in /proc, so any local user
+	// could lift it out of ps.
+	pushToken := os.Getenv("NODECHECK_PUSH_TOKEN")
 
 	if *showVer {
 		fmt.Println("nodecheck", version)
@@ -304,6 +338,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	startedAt := time.Now().UTC()
 	results := runAll(context.Background(), targets, *timeout, *conc)
 
 	// sort.Slice takes a comparison func — a closure that can see the
@@ -325,6 +360,36 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown format: %s\n", *format)
 		os.Exit(2)
+	}
+
+	if *pushURL != "" {
+		source := *pushSource
+		if source == "" {
+			host, err := os.Hostname()
+			if err != nil || host == "" {
+				host = "unknown"
+			}
+			source = "nodecheck@" + host
+		}
+
+		runID, err := newUUIDv4()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "push error:", err)
+			os.Exit(3)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), *pushTimeout)
+		client := &http.Client{Timeout: *pushTimeout}
+		err = pushResults(ctx, client, *pushURL, pushToken, buildPayload(runID, source, startedAt, results))
+		cancel()
+
+		if err != nil {
+			// Exit 3 keeps this distinct from "a node is down": the nodes may
+			// be perfectly healthy while the prober itself failed to report,
+			// and those two want different alerts.
+			fmt.Fprintln(os.Stderr, "push error:", err)
+			os.Exit(3)
+		}
 	}
 
 	// Exit 1 if any node is down — convenient for cron jobs and alerting.

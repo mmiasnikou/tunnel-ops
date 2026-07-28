@@ -2,3 +2,7 @@
 /dist/
 coverage.out
 *.tar.gz
+/nodecheck
+/tmp/
+*.patch
+*.tar.gz

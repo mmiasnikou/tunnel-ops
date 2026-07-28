@@ -68,6 +68,9 @@ nodecheck -version
 | `-timeout` | `5s` | timeout applied to **each phase** separately |
 | `-concurrency` | `32` | maximum probes in flight at once |
 | `-format` | `json` | `json` or `prom` |
+| `-push-url` | — | probestore ingest endpoint; when set, the batch is also stored |
+| `-push-timeout` | `10s` | timeout for the push request |
+| `-push-source` | `nodecheck@<hostname>` | source label recorded with the run |
 | `-version` | | print version and exit |
 
 **Exit codes:** `0` all nodes healthy, `1` at least one node down (or a bad
@@ -85,6 +88,26 @@ See [`examples/targets.json`](examples/targets.json).
 
 `sni` is the masquerade host the node should present. If omitted, the host part
 of `addr` is used.
+
+## Storing history
+
+A single probe answers *"is the node up right now?"*. Point `-push-url` at a
+[probestore](probestore/) instance and the answers accumulate instead:
+
+```bash
+export NODECHECK_PUSH_TOKEN=...        # never pass the token as a flag: argv is world-readable
+nodecheck -targets targets.json -push-url https://probes.example.com/v1/runs
+```
+
+Each run carries a generated `run_id`, and probestore keys ingestion on it, so
+a push retried after a network failure is stored exactly once. The retry loop
+(immediate, then 1s, then 3s) exists because a prober that gives up on the
+first refused connection loses precisely the outage it was built to record.
+Rejected credentials are not retried — a 401 will be a 401 next time too.
+
+Exit codes: `1` a node is down, `2` bad usage, `3` the push failed. The last
+one is deliberately distinct: healthy nodes plus a prober that cannot report
+is a different alert from a node going dark.
 
 ## Metrics
 
