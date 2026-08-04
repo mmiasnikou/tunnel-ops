@@ -3,8 +3,14 @@
 Operational tooling for running fleets of tunnel exit nodes — WireGuard,
 AmneziaWG, VLESS/Reality and friends.
 
-Small, dependency-free Go binaries that answer operational questions about a
-distributed node fleet. Standard library only, static binaries, no runtime.
+Small Go binaries that answer operational questions about a distributed node
+fleet. Static binaries, no runtime.
+
+Dependencies are the standard library plus `golang.org/x/*`, and nothing else.
+The exception is not decorative: the WireGuard prober needs BLAKE2s and
+ChaCha20-Poly1305, neither of which is in `std` (X25519 is, via `crypto/ecdh`).
+Anything outside `std` and `golang.org/x` is a deliberate decision, not a
+convenience.
 
 | Binary | What it does |
 | --- | --- |
@@ -112,6 +118,7 @@ file written before probers existed keeps working untouched.
 | --- | --- | --- |
 | `tls` (default) | `tcp`, `tls` | TCP connect, then a TLS handshake with the expected SNI |
 | `udp` | `udp`, `response` | sends a datagram, accepts any reply as proof of life |
+| `wireguard` | `udp`, `handshake` | sends a real Noise IK handshake initiation, expects a handshake response |
 
 ```json
 [
@@ -141,6 +148,88 @@ second phase — something answered, or nothing did. What it cannot tell you is
 whether the thing that answered speaks the protocol you expect; that needs a
 real handshake, which is what the WireGuard/AmneziaWG probers on the roadmap
 will add.
+
+#### `wireguard`
+
+Builds a genuine WireGuard handshake initiation (Noise IK, message type 1) and
+waits for a handshake response (type 2) that carries our own session index
+back. Unlike `udp`, this confirms that what is listening really speaks
+WireGuard.
+
+```json
+{ "name": "de-fra-01-wg", "addr": "203.0.113.10:51820", "region": "de",
+  "proto": "wireguard",
+  "params": { "public_key": "RVhBTVBMRS1LRVktRE8tTk9ULVVTRS1JTi1QUk9EISE=" } }
+```
+
+The key above, and the one in [`examples/targets.json`](examples/targets.json),
+is a placeholder — it decodes to the ASCII text `EXAMPLE-KEY-DO-NOT-USE-IN-PROD!!`
+and belongs to no node. Replace it with the output of `wg show wg0 public-key`
+from the node you are probing.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `public_key` | — | the node's static public key, base64 as `wg(8)` prints it. Required |
+| `attempts` | `3` | total initiations sent before calling the node silent |
+| `allow_anonymous` | `false` | probe without a registered monitoring peer, at the cost of what the result means. See below |
+
+**A `wireguard` target requires a registered monitoring peer.** WireGuard is
+deliberately silent to peers it does not recognise: the node decrypts the
+initiator's static key, finds no such peer, and drops the packet without a
+word. A probe using an ad-hoc key could therefore never report anything but a
+timeout, and a whole fleet would show up as down because of a missing
+environment variable. So `nodecheck` refuses such a target when it loads the
+file — exit `1`, naming the target — rather than probing it and calling the
+node dead.
+
+##### Setting up the monitoring peer
+
+On the monitoring host:
+
+```bash
+wg genkey | tee monitor.key | wg pubkey > monitor.pub
+export NODECHECK_WG_PRIVATE_KEY=$(cat monitor.key)
+```
+
+On every node, register that public key as a peer with an address range of its
+own:
+
+```bash
+sudo wg set wg0 peer "$(cat monitor.pub)" allowed-ips 10.99.0.254/32
+```
+
+To keep it across restarts, add to `/etc/wireguard/wg0.conf`:
+
+```ini
+[Peer]
+PublicKey = <contents of monitor.pub>
+AllowedIPs = 10.99.0.254/32
+```
+
+The private key is read from the environment only, never from a flag or the
+targets file — the same rule as the push token.
+
+##### `allow_anonymous`
+
+For a node where registering a monitoring peer is not possible, set
+`"allow_anonymous": true`. The initiator's key is then generated fresh per
+probe and the second phase is renamed `initiation-sent`, because that is all it
+can claim: a well-formed initiation left the host and nothing contradicted it.
+
+**Silence passes in this mode**, so the phase is not evidence that the node is
+alive. That is enforced rather than documented: an anonymous target is kept out
+of `vpnnode_up` entirely and reported in
+[`vpnnode_initiation_sent`](#metrics) instead, so no alert built on `vpnnode_up`
+can be fed by it. What the mode still catches is an ICMP port-unreachable
+(nothing is listening) and an answer that is not WireGuard. For real liveness
+on such a node, use a `udp` target instead.
+
+`mac1` is computed properly — without it a responder discards the packet in
+silence. `mac2` and the cookie mechanism are not implemented: a responder under
+load answers with a cookie reply (type 3). In the default mode that is reported
+as its own named failure rather than as silence, since it still proves a
+WireGuard endpoint is there; under `allow_anonymous` it counts as a pass, being
+strictly stronger evidence than the silence that already passes.
 
 `params` are input configuration and are never echoed back into the output — a
 result gets printed, piped into a textfile collector, logged and pasted into
@@ -194,6 +283,7 @@ vpnnode_up{node,region}                     1 / 0
 vpnnode_tcp_connect_seconds{node,region}
 vpnnode_tls_handshake_seconds{node,region}
 vpnnode_cert_match{node,region}             1 / 0
+vpnnode_initiation_sent{node,region}        1 / 0
 ```
 
 Labels are deliberately restricted to `node` and `region`, both of bounded
@@ -203,12 +293,21 @@ not a label either: it would be bounded, but adding it changes the identity of
 every existing series and breaks the dashboards and recording rules already
 built on them.
 
-`vpnnode_up` covers every node whatever its protocol. The phase metrics carry
-a sample only for the nodes that actually ran that phase, so a `udp` node
-appears in `vpnnode_up` and nowhere else — publishing `0.0000` for a handshake
-it never performed would feed an invented number to anything computing an
-average. The metric families are always declared, so the shape of a scrape
-does not change with the composition of the fleet.
+`vpnnode_up` carries every result that is a statement about node liveness — and
+only those. A probe that cannot make that statement is published in
+`vpnnode_initiation_sent` instead and never appears in `vpnnode_up` at all;
+today that is exactly the `wireguard` targets with `allow_anonymous: true`,
+where silence is the designed answer from a healthy node and from an absent one
+alike. `vpnnode_initiation_sent` is `1` when a valid initiation went out and
+nothing contradicted it, `0` when something did (ICMP port-unreachable, or an
+answer that is not WireGuard). Alert on `vpnnode_up`; treat
+`vpnnode_initiation_sent` as "the packet left and nothing said otherwise".
+
+The phase metrics carry a sample only for the nodes that actually ran that
+phase, so a `udp` node appears in `vpnnode_up` and nowhere else — publishing
+`0.0000` for a handshake it never performed would feed an invented number to
+anything computing an average. The metric families are always declared, so the
+shape of a scrape does not change with the composition of the fleet.
 
 ### Collecting
 
@@ -240,11 +339,13 @@ certificate fingerprint per target closes it — see the roadmap.
 
 - Certificate fingerprint pinning per target, to detect interception
 - `/metrics` HTTP endpoint for pull-based scraping instead of one-shot runs
-- WireGuard/AmneziaWG probers: a real UDP handshake instead of "any reply".
-  Both need Curve25519 + BLAKE2s + ChaCha20-Poly1305, and only the first of
-  those is in the standard library — so this one costs either a `x/crypto`
-  dependency or a vendored implementation, and that trade is worth making
-  deliberately rather than by accident
+- AmneziaWG prober: the same handshake under its obfuscation parameters
+  (`jc`, `jmin`, `jmax`, `s1`, `s2`, `h1`–`h4`)
+- `mac2` and cookie retry for the WireGuard prober, so a responder under load
+  can be probed rather than just recognised
+- Cryptographic verification of the WireGuard handshake response, which would
+  prove the responder holds the configured private key rather than only that
+  it answered our session
 - Push non-`tls` results to probestore (needs the coordinated ingest change
   described under [Storing history](#storing-history))
 - Probes originating from inside filtered networks — the metric that actually

@@ -18,3 +18,5 @@ vpnnode_tls_handshake_seconds{node="self-test",region="local"} 0.0000
 vpnnode_cert_match{node="de-fra-01",region="de"} 1
 vpnnode_cert_match{node="nl-ams-01",region="nl"} 0
 vpnnode_cert_match{node="self-test",region="local"} 0
+# HELP vpnnode_initiation_sent A valid protocol initiation was sent and not contradicted; not a liveness signal
+# TYPE vpnnode_initiation_sent gauge

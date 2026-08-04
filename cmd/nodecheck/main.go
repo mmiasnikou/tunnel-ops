@@ -105,6 +105,12 @@ type Result struct {
 	// and tls_* fields above cannot express. Absent for TCP+TLS results, so
 	// the historical output is unchanged byte for byte.
 	Phases []phaseJSON `json:"phases,omitempty"`
+
+	// noLivenessClaim routes this result away from vpnnode_up and into
+	// vpnnode_initiation_sent. Unexported, so it stays out of the JSON
+	// entirely: it is a fact about what the probe can assert, not a field of
+	// the report. See Outcome.NoLivenessClaim.
+	noLivenessClaim bool
 }
 
 // phaseJSON is the wire form of Phase.
@@ -205,12 +211,18 @@ func loadTargets(path string) ([]Target, error) {
 // Taking an io.Writer instead of hard-coding os.Stdout keeps the function
 // trivially testable — a bytes.Buffer drops straight in.
 //
-// vpnnode_up is emitted for every result, because "is this node reachable" is
-// the one question that means the same thing whatever the protocol. The phase
-// metrics are emitted only for the results that actually ran that phase: a
-// UDP node has no TLS handshake, and publishing 0.0000 for it would put an
-// invented value into a series that dashboards average. A gap is the honest
-// encoding of "not measured", and Prometheus already handles gaps.
+// vpnnode_up carries every result that is a statement about node liveness,
+// whatever the protocol — and only those. A probe that cannot make that
+// statement (an anonymous WireGuard initiation, where a healthy node and an
+// absent one are both silent) is reported in vpnnode_initiation_sent instead.
+// It would be easy to publish a 1 there and let the documentation warn people
+// off it, but vpnnode_up is precisely the series alerts are built on, and a
+// false 1 in it is worse than no data at all.
+//
+// The phase metrics are emitted only for the results that actually ran that
+// phase: a UDP node has no TLS handshake, and publishing 0.0000 for it would
+// put an invented value into a series that dashboards average. A gap is the
+// honest encoding of "not measured", and Prometheus already handles gaps.
 //
 // The HELP/TYPE lines are printed unconditionally so the exporter declares the
 // same set of metric families on every scrape, even for a fleet where nothing
@@ -219,6 +231,9 @@ func writeProm(w io.Writer, results []Result) {
 	fmt.Fprintln(w, "# HELP vpnnode_up Node is reachable (both TCP and TLS succeeded)")
 	fmt.Fprintln(w, "# TYPE vpnnode_up gauge")
 	for _, r := range results {
+		if r.noLivenessClaim {
+			continue
+		}
 		fmt.Fprintf(w, "vpnnode_up{%s} %d\n", labels(r), boolToInt(r.OK))
 	}
 
@@ -243,6 +258,18 @@ func writeProm(w io.Writer, results []Result) {
 	for _, r := range results {
 		if r.CertMatch != nil {
 			fmt.Fprintf(w, "vpnnode_cert_match{%s} %d\n", labels(r), boolToInt(*r.CertMatch))
+		}
+	}
+
+	// The counterpart to vpnnode_up for probes that cannot assert liveness.
+	// A 1 means a valid initiation went out and nothing contradicted it; it is
+	// deliberately NOT a claim that the node answered, because in this mode
+	// nothing was expected to.
+	fmt.Fprintln(w, "# HELP vpnnode_initiation_sent A valid protocol initiation was sent and not contradicted; not a liveness signal")
+	fmt.Fprintln(w, "# TYPE vpnnode_initiation_sent gauge")
+	for _, r := range results {
+		if r.noLivenessClaim {
+			fmt.Fprintf(w, "vpnnode_initiation_sent{%s} %d\n", labels(r), boolToInt(r.OK))
 		}
 	}
 }

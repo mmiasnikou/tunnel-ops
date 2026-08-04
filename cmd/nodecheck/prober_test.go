@@ -21,6 +21,7 @@ func TestProberForDefaultsToTLS(t *testing.T) {
 		{"empty proto is the original check", Target{Addr: "1.2.3.4:443"}, "tls"},
 		{"explicit tls", Target{Addr: "1.2.3.4:443", Proto: "tls"}, "tls"},
 		{"udp", Target{Addr: "1.2.3.4:51820", Proto: "udp"}, "udp"},
+		{"wireguard", Target{Addr: "1.2.3.4:51820", Proto: "wireguard"}, "wireguard"},
 	}
 
 	for _, c := range cases {
@@ -37,13 +38,15 @@ func TestProberForDefaultsToTLS(t *testing.T) {
 }
 
 func TestProberForUnknownProto(t *testing.T) {
-	_, err := proberFor(Target{Addr: "1.2.3.4:443", Proto: "wireguard"})
+	_, err := proberFor(Target{Addr: "1.2.3.4:443", Proto: "quic"})
 	if err == nil {
 		t.Fatal("an unregistered proto must be rejected")
 	}
 	// The message should list what IS available — a typo is the likeliest cause.
-	if !strings.Contains(err.Error(), "tls") || !strings.Contains(err.Error(), "udp") {
-		t.Errorf("error should list the known protos, got %v", err)
+	for _, kind := range []string{"tls", "udp", "wireguard"} {
+		if !strings.Contains(err.Error(), kind) {
+			t.Errorf("error should list %q among the known protos, got %v", kind, err)
+		}
 	}
 }
 

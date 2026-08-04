@@ -15,9 +15,10 @@
     "name": "de-fra-01-wg",
     "addr": "203.0.113.10:51820",
     "region": "de",
-    "proto": "udp",
+    "proto": "wireguard",
     "params": {
-      "payload_hex": "01000000",
+      "public_key": "RVhBTVBMRS1LRVktRE8tTk9ULVVTRS1JTi1QUk9EISE=",
+      "allow_anonymous": true,
       "attempts": 3
     }
   },

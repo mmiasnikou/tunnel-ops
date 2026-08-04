@@ -19,6 +19,13 @@ import (
 // rule or a script somebody already wrote. If a change here fails, the answer
 // is almost always to change the code back, not the fixture.
 //
+// The fixture has been edited exactly once since it was captured, and only by
+// hand after inspecting the diff: adding vpnnode_initiation_sent introduced
+// two HELP/TYPE lines at the end of the Prometheus output, since every metric
+// family is declared on every scrape whether or not the fleet populates it.
+// No existing line moved or changed. Hold any future edit to that standard —
+// a diff you have read line by line, appended rather than regenerated.
+//
 // The fixture is rendered rather than probed because a live probe cannot be
 // byte-identical twice — durations and timestamps move. What is being frozen
 // is the encoding, which is exactly the part the pointer conversion put at

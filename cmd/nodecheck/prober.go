@@ -68,6 +68,18 @@ type TLSInfo struct {
 type Outcome struct {
 	Phases []Phase
 	TLS    *TLSInfo
+
+	// NoLivenessClaim marks an outcome whose phases passing does not mean the
+	// node is up — an anonymous WireGuard initiation, where silence is the
+	// designed answer from a healthy node and therefore from an absent one
+	// too. Such a result is kept out of vpnnode_up entirely: publishing a 1
+	// there would be a false statement in the metric operators alert on, and
+	// that is worse than having no data. The prober decides this, not the
+	// renderer, because only the prober knows what its phases mean.
+	//
+	// The zero value claims liveness, so an ordinary prober need not think
+	// about it.
+	NoLivenessClaim bool
 }
 
 // failed returns the first failing phase, or nil when every phase passed.
@@ -182,6 +194,7 @@ func newResult(t Target) Result {
 // it must not see a field disappear.
 func toResult(t Target, o Outcome) Result {
 	res := newResult(t)
+	res.noLivenessClaim = o.NoLivenessClaim
 
 	if usesLegacyPhases(o) {
 		res.TCPOK = ptr(false)
