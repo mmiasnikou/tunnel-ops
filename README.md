@@ -85,7 +85,9 @@ nodecheck -version
 | `-version` | | print version and exit |
 
 **Exit codes:** `0` all nodes healthy, `1` at least one node down (or a bad
-targets file), `2` invalid arguments. Suitable for cron and alerting directly.
+targets file), `2` invalid arguments, `3` the push failed. Suitable for cron
+and alerting directly. The last one is deliberately distinct: healthy nodes
+plus a prober that cannot report is a different alert from a node going dark.
 
 ### Target file
 
@@ -93,7 +95,7 @@ See [`examples/targets.json`](examples/targets.json).
 
 ```json
 [
-  { "name": "de-fra-01", "addr": "1.2.3.4:443", "sni": "www.microsoft.com", "region": "de" }
+  { "name": "de-fra-01", "addr": "203.0.113.10:443", "sni": "www.microsoft.com", "region": "de" }
 ]
 ```
 
@@ -109,6 +111,19 @@ What is *not* pre-checked is anything the probe itself reports better: an
 address with no port, an unresolvable host. Those come back as ordinary failed
 probes, so one bad line does not suppress the results for the rest of the fleet.
 
+## Handling the targets file
+
+`targets.json` is a curated map of a live fleet in a single file. It is more
+sensitive than anything the tool outputs: treat it as a secret, keep it out of
+version control, and remember that probe output, CI artifacts and logs carry
+the same addresses. Every address in this repository is from the documentation
+ranges reserved by RFC 5737 and belongs to no node.
+
+Secrets do not belong in the targets file either. The push token and the
+WireGuard monitoring key are read from the environment only — a targets file
+gets copied between hosts and committed, and a flag is world-readable through
+`/proc`.
+
 ### Probers
 
 A target picks its check with `proto`. Omitting it means `tls` — every targets
@@ -122,8 +137,11 @@ file written before probers existed keeps working untouched.
 
 ```json
 [
-  { "name": "de-fra-01", "addr": "1.2.3.4:443", "sni": "www.microsoft.com", "region": "de" },
-  { "name": "de-fra-01-wg", "addr": "1.2.3.4:51820", "region": "de", "proto": "udp",
+  { "name": "de-fra-01", "addr": "203.0.113.10:443", "sni": "www.microsoft.com", "region": "de" },
+  { "name": "de-fra-01-wg", "addr": "203.0.113.10:51820", "region": "de",
+    "proto": "wireguard",
+    "params": { "public_key": "RVhBTVBMRS1LRVktRE8tTk9ULVVTRS1JTi1QUk9EISE=" } },
+  { "name": "nl-ams-01-dns", "addr": "203.0.113.11:53", "region": "nl", "proto": "udp",
     "params": { "payload_hex": "01000000", "attempts": 3 } }
 ]
 ```
@@ -146,8 +164,8 @@ sends nothing and a write only hands the datagram to the kernel, so that phase
 failing is nearly always a local configuration problem. The signal is in the
 second phase — something answered, or nothing did. What it cannot tell you is
 whether the thing that answered speaks the protocol you expect; that needs a
-real handshake, which is what the WireGuard/AmneziaWG probers on the roadmap
-will add.
+real handshake, which is what the `wireguard` prober below does, and what the
+AmneziaWG prober on the roadmap will add for its obfuscated variant.
 
 #### `wireguard`
 
@@ -182,19 +200,30 @@ environment variable. So `nodecheck` refuses such a target when it loads the
 file — exit `1`, naming the target — rather than probing it and calling the
 node dead.
 
+This is a real operational cost, and it is worth knowing before you adopt the
+prober: one keypair has to exist and its public half has to be registered as a
+peer on every node in the fleet. One pair covers the whole fleet, and rolling
+it out is a single Ansible task or a line in a Terraform template, but it is
+not zero.
+
 ##### Setting up the monitoring peer
 
 On the monitoring host:
 
 ```bash
 wg genkey | tee monitor.key | wg pubkey > monitor.pub
+chmod 600 monitor.key
 export NODECHECK_WG_PRIVATE_KEY=$(cat monitor.key)
 ```
 
+Keep the key out of any repository working tree.
+
 On every node, register that public key as a peer with an address range of its
-own:
+own. Check what is already taken first — an `allowed-ips` range that overlaps
+an existing peer will break that peer's routing:
 
 ```bash
+sudo wg show wg0 allowed-ips
 sudo wg set wg0 peer "$(cat monitor.pub)" allowed-ips 10.99.0.254/32
 ```
 
@@ -208,6 +237,26 @@ AllowedIPs = 10.99.0.254/32
 
 The private key is read from the environment only, never from a flag or the
 targets file — the same rule as the push token.
+
+##### Reading `wg show` after a probe
+
+`wg show wg0 latest-handshakes` will keep reporting `0` for the monitoring
+peer, and that is correct. A responder does not consider a session established
+until the initiator sends a transport packet; the probe deliberately sends
+none, so it leaves no session behind and no state on the node.
+
+Look at the transfer counters instead:
+
+```
+peer: <contents of monitor.pub>
+  endpoint: 198.51.100.7:9824
+  allowed ips: 10.99.0.254/32
+  transfer: 148 B received, 92 B sent
+```
+
+Those 92 bytes are the proof. To send them the node had to verify `mac1`,
+decrypt the initiator's static key, find the peer, and accept the TAI64N
+timestamp — every AEAD tag had to check out.
 
 ##### `allow_anonymous`
 
@@ -231,11 +280,15 @@ as its own named failure rather than as silence, since it still proves a
 WireGuard endpoint is there; under `allow_anonymous` it counts as a pass, being
 strictly stronger evidence than the silence that already passes.
 
+The prober is not only tested against local fixtures: the initiation it builds
+has been accepted by a real WireGuard responder, which answered with a
+handshake response over the public internet.
+
+### Output shape
+
 `params` are input configuration and are never echoed back into the output — a
 result gets printed, piped into a textfile collector, logged and pasted into
 tickets, and prober settings have no diagnostic value on any of those surfaces.
-Secrets still do not belong there, for the same reason the push token is
-environment-only: a targets file gets copied between hosts and committed.
 
 Protocol-specific fields are omitted from the output rather than reported as
 zero. A `udp` result carries no `tcp_ok`, `tls_seconds` or `cert_match` keys at
@@ -260,10 +313,6 @@ a push retried after a network failure is stored exactly once. The retry loop
 first refused connection loses precisely the outage it was built to record.
 Rejected credentials are not retried — a 401 will be a 401 next time too.
 
-Exit codes: `1` a node is down, `2` bad usage, `3` the push failed. The last
-one is deliberately distinct: healthy nodes plus a prober that cannot report
-is a different alert from a node going dark.
-
 **Only `tls` results are pushed.** The ingest payload's `tcp_ok`/`tls_ok` are
 required booleans, so a `udp` result has no honest way to fill them — shipping
 one would record `tcp_ok: false, failed_phase: "tcp"` as history for a node
@@ -275,6 +324,11 @@ phase booleans in the payload, and probestore's `node` uniqueness reconsidered
 — it keys on `(addr, sni)`, and UDP targets have no SNI, so two protocols on
 one address would collide into a single node. That is a separate, coordinated
 change.
+
+probestore's read endpoints are unauthenticated by design, on the assumption of
+a reverse proxy in front. Do not expose `/metrics` or `/v1/nodes` publicly:
+together they are the whole fleet, addresses included, served over HTTP and
+aggregated more conveniently than any scanner could manage on its own.
 
 ## Metrics
 
@@ -291,7 +345,8 @@ cardinality. Do not add `user_id`, `session_id` or `host:port` — that is the
 direct route to a cardinality explosion and a dead metrics store. `proto` is
 not a label either: it would be bounded, but adding it changes the identity of
 every existing series and breaks the dashboards and recording rules already
-built on them.
+built on them. Node names and regions go out; addresses stay in the targets
+file.
 
 `vpnnode_up` carries every result that is a statement about node liveness — and
 only those. A probe that cannot make that statement is published in
@@ -302,6 +357,10 @@ alike. `vpnnode_initiation_sent` is `1` when a valid initiation went out and
 nothing contradicted it, `0` when something did (ICMP port-unreachable, or an
 answer that is not WireGuard). Alert on `vpnnode_up`; treat
 `vpnnode_initiation_sent` as "the packet left and nothing said otherwise".
+
+One consequence worth planning for: switching an existing target to
+`allow_anonymous` makes its `vpnnode_up` series stop, which to Prometheus looks
+like a target that went away. An alert built on `absent()` will fire.
 
 The phase metrics carry a sample only for the nodes that actually ran that
 phase, so a `udp` node appears in `vpnnode_up` and nowhere else — publishing
@@ -334,6 +393,15 @@ distinguish an honest node from one behind an intercepting middlebox whose CA
 is already trusted by the host running the probe. For a fleet whose whole
 purpose is resisting interception, that gap matters. Pinning an expected
 certificate fingerprint per target closes it — see the roadmap.
+
+The `wireguard` prober needs a monitoring peer registered on every node, as
+described above. Where that is not possible, `allow_anonymous` is available but
+proves considerably less.
+
+The WireGuard handshake response is currently accepted on its message type and
+session index; its contents are not decrypted. That is enough to prove a
+WireGuard endpoint answered our specific initiation, but not that it holds the
+private key matching the configured `public_key` — see the roadmap.
 
 ## Roadmap
 

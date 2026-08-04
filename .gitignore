@@ -6,3 +6,6 @@ coverage.out
 /tmp/
 *.patch
 *.tar.gz
+monitor.key
+monitor.pub
+*.key
