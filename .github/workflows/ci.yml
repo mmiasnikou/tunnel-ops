@@ -14,7 +14,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.x"
           cache: true
 
       # Check formatting but never fix it: CI must fail loudly rather than
@@ -58,7 +58,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.26.x"
           cache: true
 
       # ./... covers every cmd/ subdirectory, so a new tool is picked up
