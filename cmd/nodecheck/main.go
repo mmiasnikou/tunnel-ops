@@ -22,7 +22,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -52,6 +51,20 @@ type Target struct {
 	// deliberately separate from Region: when a provider starts getting its
 	// ranges filtered, the failures cluster by vendor, not by geography.
 	Provider string `json:"provider,omitempty"`
+
+	// Proto selects the prober (see prober.go). Empty means "tls", the
+	// original TCP+TLS check, so every targets file written before probers
+	// existed keeps working untouched.
+	Proto string `json:"proto,omitempty"`
+
+	// Params holds prober-specific settings, left as raw JSON so each prober
+	// decodes its own shape. Keeping them here instead of adding a field per
+	// protocol is what stops Target from growing a column for every future
+	// check.
+	//
+	// Secrets do not belong here — same reason the push token is env-only:
+	// a targets file gets copied around, committed and pasted into tickets.
+	Params json.RawMessage `json:"params,omitempty"`
 }
 
 // Result is the outcome of one probe.
@@ -67,118 +80,44 @@ type Result struct {
 	// TCPOK and TLSOK record which phases actually succeeded. Without them a
 	// consumer has to guess by string-matching the Error prefix, which breaks
 	// the moment the wording changes.
-	TCPOK bool `json:"tcp_ok"`
-	TLSOK bool `json:"tls_ok"`
+	//
+	// They are pointers because not every prober has these phases at all. For
+	// a TCP+TLS probe they are always emitted — including as false for a
+	// phase that was never reached, exactly as before probers existed. For a
+	// UDP probe the keys are absent, which says "not applicable"; emitting
+	// false there would claim a TCP connect was tried and failed.
+	TCPOK *bool `json:"tcp_ok,omitempty"`
+	TLSOK *bool `json:"tls_ok,omitempty"`
 
 	// Timestamp is when the probe finished, in UTC. Set by the caller so
 	// there is exactly one place doing it.
 	Timestamp time.Time `json:"ts"`
 
-	TCPTime   float64 `json:"tcp_seconds"`
-	TLSTime   float64 `json:"tls_seconds"`
-	TLSVer    string  `json:"tls_version,omitempty"` // omitempty: skip when unset
-	ALPN      string  `json:"alpn,omitempty"`
-	CertCN    string  `json:"cert_cn,omitempty"`
-	CertMatch bool    `json:"cert_match"`
-	Error     string  `json:"error,omitempty"`
+	TCPTime   *float64 `json:"tcp_seconds,omitempty"`
+	TLSTime   *float64 `json:"tls_seconds,omitempty"`
+	TLSVer    string   `json:"tls_version,omitempty"` // omitempty: skip when unset
+	ALPN      string   `json:"alpn,omitempty"`
+	CertCN    string   `json:"cert_cn,omitempty"`
+	CertMatch *bool    `json:"cert_match,omitempty"`
+	Error     string   `json:"error,omitempty"`
+
+	// Phases reports the raw phase list for probers whose phases the tcp_*
+	// and tls_* fields above cannot express. Absent for TCP+TLS results, so
+	// the historical output is unchanged byte for byte.
+	Phases []phaseJSON `json:"phases,omitempty"`
 }
 
-// probe checks a single node and returns a Result. Returning a value rather
-// than mutating an argument is the idiomatic Go choice.
+// phaseJSON is the wire form of Phase.
 //
-// ctx allows the whole batch to be cancelled from the outside (Ctrl+C, a
-// shared deadline). timeout bounds each phase separately.
-func probe(ctx context.Context, t Target, timeout time.Duration) Result {
-	res := Result{Target: t}
-
-	// Resolve the effective SNI before probing anything. Doing it here rather
-	// than between the phases means a node that fails at TCP is still
-	// reported with the name it would have been probed under — otherwise the
-	// same node shows up under two different identities depending on how far
-	// the probe got.
-	sni := t.SNI
-	if sni == "" {
-		if host, _, splitErr := net.SplitHostPort(t.Addr); splitErr == nil {
-			// The blank identifier _ means "this value is not needed" (the port).
-			sni = host
-		}
-	}
-	res.SNI = sni
-
-	// ---------- Phase 1: TCP ----------
-
-	// context.WithTimeout returns TWO values: a derived context and a cancel
-	// func. Go requires the cancel func to be called, so it goes in a defer
-	// and runs when this function returns.
-	ctxTCP, cancelTCP := context.WithTimeout(ctx, timeout)
-	defer cancelTCP()
-
-	start := time.Now()
-	var dialer net.Dialer // the zero value of net.Dialer is immediately usable
-	conn, err := dialer.DialContext(ctxTCP, "tcp", t.Addr)
-	res.TCPTime = time.Since(start).Seconds()
-
-	// Canonical Go: an error is an ordinary return value, checked immediately
-	// after the call that produced it.
-	if err != nil {
-		res.Error = "tcp: " + err.Error()
-		return res
-	}
-	conn.Close() // the TCP phase is measured; the connection is no longer needed
-	res.TCPOK = true
-
-	// ---------- Phase 2: TLS ----------
-
-	ctxTLS, cancelTLS := context.WithTimeout(ctx, timeout)
-	defer cancelTLS()
-
-	tlsDialer := &tls.Dialer{
-		NetDialer: &net.Dialer{},
-		Config: &tls.Config{
-			ServerName: sni,
-			MinVersion: tls.VersionTLS12,
-			// Advertise the same ALPN a real browser would. This matters for
-			// Reality: the server must answer exactly like the site it is
-			// impersonating, otherwise it stands out to active probing.
-			NextProtos: []string{"h2", "http/1.1"},
-			// Chain verification is deliberately left ON. A Reality node is
-			// supposed to present the genuine certificate of a real third-party
-			// site. If it cannot, that is itself the signal, and the handshake
-			// will fail on its own.
-		},
-	}
-
-	start = time.Now()
-	tlsConn, err := tlsDialer.DialContext(ctxTLS, "tcp", t.Addr)
-	res.TLSTime = time.Since(start).Seconds()
-	if err != nil {
-		res.Error = "tls: " + err.Error()
-		return res
-	}
-	defer tlsConn.Close()
-
-	// DialContext hands back a net.Conn interface. We need the concrete
-	// *tls.Conn to inspect handshake details — that is a type assertion. The
-	// two-value form (v, ok) returns false instead of panicking on mismatch.
-	tc, ok := tlsConn.(*tls.Conn)
-	if !ok {
-		res.Error = "tls: unexpected connection type"
-		return res
-	}
-
-	state := tc.ConnectionState()
-	res.TLSVer = tlsVersionName(state.Version)
-	res.ALPN = state.NegotiatedProtocol
-	if len(state.PeerCertificates) > 0 {
-		leaf := state.PeerCertificates[0]
-		res.CertCN = leaf.Subject.CommonName
-		// VerifyHostname returns an error; nil means the name matched.
-		res.CertMatch = leaf.VerifyHostname(sni) == nil
-	}
-
-	res.TLSOK = true
-	res.OK = true
-	return res
+// Separate from the domain type for the same reason push.go keeps its own
+// payload types: Phase measures a time.Duration, while the output has always
+// reported seconds as a float, and neither side should have to bend to the
+// other.
+type phaseJSON struct {
+	Name    string  `json:"name"`
+	OK      bool    `json:"ok"`
+	Seconds float64 `json:"seconds"`
+	Error   string  `json:"error,omitempty"`
 }
 
 // runAll probes every target concurrently, but never more than conc at once.
@@ -242,6 +181,22 @@ func loadTargets(path string) ([]Target, error) {
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("target list is empty: %s", path)
 	}
+
+	// Resolve and validate every prober up front. A target naming a protocol
+	// that does not exist, or missing a parameter its protocol needs, is a
+	// broken config — and reporting it as a node that failed its probe would
+	// hide a typo inside what looks like an outage. Failing here also means
+	// nothing is pushed, so probestore never records a fake down node.
+	for i, t := range targets {
+		p, err := proberFor(t)
+		if err != nil {
+			return nil, fmt.Errorf("%s: target %d (%s): %w", path, i, t.Name, err)
+		}
+		if err := p.Validate(t); err != nil {
+			return nil, fmt.Errorf("%s: target %d (%s): %s: %w", path, i, t.Name, p.Kind(), err)
+		}
+	}
+
 	return targets, nil
 }
 
@@ -249,6 +204,17 @@ func loadTargets(path string) ([]Target, error) {
 //
 // Taking an io.Writer instead of hard-coding os.Stdout keeps the function
 // trivially testable — a bytes.Buffer drops straight in.
+//
+// vpnnode_up is emitted for every result, because "is this node reachable" is
+// the one question that means the same thing whatever the protocol. The phase
+// metrics are emitted only for the results that actually ran that phase: a
+// UDP node has no TLS handshake, and publishing 0.0000 for it would put an
+// invented value into a series that dashboards average. A gap is the honest
+// encoding of "not measured", and Prometheus already handles gaps.
+//
+// The HELP/TYPE lines are printed unconditionally so the exporter declares the
+// same set of metric families on every scrape, even for a fleet where nothing
+// currently populates one of them.
 func writeProm(w io.Writer, results []Result) {
 	fmt.Fprintln(w, "# HELP vpnnode_up Node is reachable (both TCP and TLS succeeded)")
 	fmt.Fprintln(w, "# TYPE vpnnode_up gauge")
@@ -259,19 +225,25 @@ func writeProm(w io.Writer, results []Result) {
 	fmt.Fprintln(w, "# HELP vpnnode_tcp_connect_seconds Time spent on the TCP connect phase")
 	fmt.Fprintln(w, "# TYPE vpnnode_tcp_connect_seconds gauge")
 	for _, r := range results {
-		fmt.Fprintf(w, "vpnnode_tcp_connect_seconds{%s} %.4f\n", labels(r), r.TCPTime)
+		if r.TCPTime != nil {
+			fmt.Fprintf(w, "vpnnode_tcp_connect_seconds{%s} %.4f\n", labels(r), *r.TCPTime)
+		}
 	}
 
 	fmt.Fprintln(w, "# HELP vpnnode_tls_handshake_seconds Time spent on the TLS handshake phase")
 	fmt.Fprintln(w, "# TYPE vpnnode_tls_handshake_seconds gauge")
 	for _, r := range results {
-		fmt.Fprintf(w, "vpnnode_tls_handshake_seconds{%s} %.4f\n", labels(r), r.TLSTime)
+		if r.TLSTime != nil {
+			fmt.Fprintf(w, "vpnnode_tls_handshake_seconds{%s} %.4f\n", labels(r), *r.TLSTime)
+		}
 	}
 
 	fmt.Fprintln(w, "# HELP vpnnode_cert_match Presented certificate matches the expected SNI")
 	fmt.Fprintln(w, "# TYPE vpnnode_cert_match gauge")
 	for _, r := range results {
-		fmt.Fprintf(w, "vpnnode_cert_match{%s} %d\n", labels(r), boolToInt(r.CertMatch))
+		if r.CertMatch != nil {
+			fmt.Fprintf(w, "vpnnode_cert_match{%s} %d\n", labels(r), boolToInt(*r.CertMatch))
+		}
 	}
 }
 

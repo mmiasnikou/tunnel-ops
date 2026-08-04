@@ -9,17 +9,8 @@
     "name": "nl-ams-01",
     "addr": "5.6.7.8:443",
     "sni": "www.cloudflare.com",
-    "region": "nl"
-  },
-  {
-    "name": "de-fra-01-wg",
-    "addr": "1.2.3.4:51820",
-    "region": "de",
-    "proto": "udp",
-    "params": {
-      "payload_hex": "01000000",
-      "attempts": 3
-    }
+    "region": "nl",
+    "provider": "vultr"
   },
   {
     "name": "self-test",

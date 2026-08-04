@@ -12,28 +12,45 @@ import (
 	"time"
 )
 
+// sampleResults builds three results the way the tool really does — through
+// toResult — so this fixture cannot drift away from what a probe produces.
 func sampleResults() []Result {
 	ts := time.Date(2026, 7, 28, 6, 0, 0, 0, time.UTC)
+
+	stamped := func(t Target, o Outcome) Result {
+		r := toResult(t, o)
+		r.Timestamp = ts
+		return r
+	}
+
 	return []Result{
-		{
-			Target:    Target{Name: "de-01", Addr: "203.0.113.10:443", SNI: "www.microsoft.com", Provider: "hetzner"},
-			OK:        true,
-			TCPOK:     true,
-			TLSOK:     true,
-			TLSTime:   0.0425,
-			Timestamp: ts,
-		},
-		{
-			Target:    Target{Name: "nl-02", Addr: "203.0.113.11:443", SNI: "www.microsoft.com"},
-			TCPOK:     true,
-			Error:     "tls: handshake failure",
-			Timestamp: ts,
-		},
-		{
-			Target:    Target{Name: "fi-03", Addr: "203.0.113.12:443", SNI: "www.microsoft.com"},
-			Error:     "tcp: i/o timeout",
-			Timestamp: ts,
-		},
+		stamped(
+			Target{Name: "de-01", Addr: "203.0.113.10:443", SNI: "www.microsoft.com", Provider: "hetzner"},
+			Outcome{
+				Phases: []Phase{
+					{Name: phaseTCP, OK: true, Duration: 12 * time.Millisecond},
+					{Name: phaseTLS, OK: true, Duration: 42500 * time.Microsecond},
+				},
+				TLS: &TLSInfo{ServerName: "www.microsoft.com", Version: "1.3"},
+			},
+		),
+		stamped(
+			Target{Name: "nl-02", Addr: "203.0.113.11:443", SNI: "www.microsoft.com"},
+			Outcome{
+				Phases: []Phase{
+					{Name: phaseTCP, OK: true, Duration: 11 * time.Millisecond},
+					{Name: phaseTLS, Duration: 30 * time.Millisecond, Err: "handshake failure"},
+				},
+				TLS: &TLSInfo{ServerName: "www.microsoft.com"},
+			},
+		),
+		stamped(
+			Target{Name: "fi-03", Addr: "203.0.113.12:443", SNI: "www.microsoft.com"},
+			Outcome{
+				Phases: []Phase{{Name: phaseTCP, Duration: 5 * time.Second, Err: "i/o timeout"}},
+				TLS:    &TLSInfo{ServerName: "www.microsoft.com"},
+			},
+		),
 	}
 }
 
@@ -61,6 +78,31 @@ func TestBuildPayloadMapsPhases(t *testing.T) {
 
 	if got := p.Results[2].FailedPhase; got != "tcp" {
 		t.Errorf("TCP down should report phase tcp, got %q", got)
+	}
+}
+
+// TestBuildPayloadSkipsNonTLSResults pins the deliberate gap: the ingest
+// contract has no way to say "this node has no TCP phase", so UDP results are
+// left out rather than shipped as tcp_ok=false, which probestore would store
+// as a node that was down.
+func TestBuildPayloadSkipsNonTLSResults(t *testing.T) {
+	results := append(sampleResults(), toResult(
+		Target{Name: "udp-01", Addr: "203.0.113.20:51820", Proto: "udp"},
+		Outcome{Phases: []Phase{
+			{Name: phaseUDPSend, OK: true, Duration: time.Millisecond},
+			{Name: phaseUDPResponse, OK: true, Duration: 9 * time.Millisecond},
+		}},
+	))
+
+	p := buildPayload("run-udp", "test", time.Now().UTC(), results)
+
+	if len(p.Results) != 3 {
+		t.Fatalf("expected only the 3 TCP+TLS results, got %d", len(p.Results))
+	}
+	for _, r := range p.Results {
+		if r.Node.Name == "udp-01" {
+			t.Fatal("a UDP result must not reach the ingest payload")
+		}
 	}
 }
 

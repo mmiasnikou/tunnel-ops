@@ -1,0 +1,20 @@
+# HELP vpnnode_up Node is reachable (both TCP and TLS succeeded)
+# TYPE vpnnode_up gauge
+vpnnode_up{node="de-fra-01",region="de"} 1
+vpnnode_up{node="nl-ams-01",region="nl"} 0
+vpnnode_up{node="self-test",region="local"} 0
+# HELP vpnnode_tcp_connect_seconds Time spent on the TCP connect phase
+# TYPE vpnnode_tcp_connect_seconds gauge
+vpnnode_tcp_connect_seconds{node="de-fra-01",region="de"} 0.0310
+vpnnode_tcp_connect_seconds{node="nl-ams-01",region="nl"} 0.0240
+vpnnode_tcp_connect_seconds{node="self-test",region="local"} 0.0010
+# HELP vpnnode_tls_handshake_seconds Time spent on the TLS handshake phase
+# TYPE vpnnode_tls_handshake_seconds gauge
+vpnnode_tls_handshake_seconds{node="de-fra-01",region="de"} 0.0820
+vpnnode_tls_handshake_seconds{node="nl-ams-01",region="nl"} 0.1910
+vpnnode_tls_handshake_seconds{node="self-test",region="local"} 0.0000
+# HELP vpnnode_cert_match Presented certificate matches the expected SNI
+# TYPE vpnnode_cert_match gauge
+vpnnode_cert_match{node="de-fra-01",region="de"} 1
+vpnnode_cert_match{node="nl-ams-01",region="nl"} 0
+vpnnode_cert_match{node="self-test",region="local"} 0

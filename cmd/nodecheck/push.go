@@ -65,18 +65,37 @@ func newUUIDv4() (string, error) {
 // failedPhase names the phase that broke, or "" when the node is healthy.
 func failedPhase(r Result) string {
 	switch {
-	case !r.TCPOK:
+	case r.TCPOK == nil || !*r.TCPOK:
 		return "tcp"
-	case !r.TLSOK:
+	case r.TLSOK == nil || !*r.TLSOK:
 		return "tls"
 	default:
 		return ""
 	}
 }
 
+// pushable reports whether a result can be expressed in the ingest payload.
+//
+// The payload's tcp_ok/tls_ok are required booleans on probestore's side, so
+// only TCP+TLS results fit it. A UDP result has no such phases, and squeezing
+// one in would push tcp_ok=false, failed_phase="tcp" for a node that is
+// perfectly healthy — a lie stored as history, which is worse than a gap.
+//
+// So non-TLS results are dropped here for now. Carrying them requires an
+// ingest contract change on both sides at once (a proto field, nullable phase
+// booleans, and probe_node's unique (addr, sni) reconsidered — UDP targets
+// have no SNI, so two protocols on one address would collide into one node).
+// That is a separate, coordinated change; see README "Storing history".
+func pushable(r Result) bool {
+	return r.TCPOK != nil && r.TLSOK != nil
+}
+
 func buildPayload(runID, source string, startedAt time.Time, results []Result) pushPayload {
 	out := make([]pushResult, 0, len(results))
 	for _, r := range results {
+		if !pushable(r) {
+			continue
+		}
 		pr := pushResult{
 			Node: pushNode{
 				Name:     r.Name,
@@ -85,13 +104,13 @@ func buildPayload(runID, source string, startedAt time.Time, results []Result) p
 				Provider: r.Provider,
 			},
 			TS:          r.Timestamp,
-			TCPOK:       r.TCPOK,
-			TLSOK:       r.TLSOK,
+			TCPOK:       *r.TCPOK,
+			TLSOK:       *r.TLSOK,
 			Error:       r.Error,
 			FailedPhase: failedPhase(r),
 		}
-		if r.TLSOK {
-			ms := r.TLSTime * 1000
+		if *r.TLSOK && r.TLSTime != nil {
+			ms := *r.TLSTime * 1000
 			pr.LatencyMS = &ms
 		}
 		out = append(out, pr)

@@ -78,7 +78,7 @@ func TestProbeTCPOkTLSFails(t *testing.T) {
 	if !strings.HasPrefix(res.Error, "tls:") {
 		t.Fatalf("expected a TLS-phase error, got %q", res.Error)
 	}
-	if res.TCPTime <= 0 {
+	if res.TCPTime == nil || *res.TCPTime <= 0 {
 		t.Error("the TCP phase duration should have been measured")
 	}
 }
@@ -101,7 +101,7 @@ func TestWritePromFormat(t *testing.T) {
 	// bytes.Buffer implements io.Writer — it substitutes for os.Stdout.
 	var buf bytes.Buffer
 	writeProm(&buf, []Result{
-		{Target: Target{Name: "de-1", Region: "de"}, OK: true, TCPTime: 0.031},
+		{Target: Target{Name: "de-1", Region: "de"}, OK: true, TCPTime: ptr(0.031)},
 	})
 
 	out := buf.String()
