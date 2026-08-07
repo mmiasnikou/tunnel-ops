@@ -1,5 +1,10 @@
 # tunnel-ops
 
+[![CI](https://github.com/mmiasnikou/tunnel-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/mmiasnikou/tunnel-ops/actions)
+[![Release](https://img.shields.io/github/v/release/mmiasnikou/tunnel-ops)](https://github.com/mmiasnikou/tunnel-ops/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+
 Operational tooling for running fleets of tunnel exit nodes — WireGuard,
 AmneziaWG, VLESS/Reality and friends.
 
@@ -12,9 +17,20 @@ ChaCha20-Poly1305, neither of which is in `std` (X25519 is, via `crypto/ecdh`).
 Anything outside `std` and `golang.org/x` is a deliberate decision, not a
 convenience.
 
-| Binary | What it does |
-| --- | --- |
-| [`nodecheck`](cmd/nodecheck) | Concurrently probes node reachability in two phases and reports JSON or Prometheus metrics |
+| Component | What it is |
+| --------- | ---------- |
+| [`nodecheck`](cmd/nodecheck) | Go binary. Concurrent two-phase probes — TLS/Reality (expected SNI), generic UDP, WireGuard (Noise IK initiation). JSON or Prometheus output, static, no runtime. |
+| [`probestore`](probestore) | FastAPI + SQLAlchemy 2.0 (async) + Alembic + PostgreSQL. Idempotent ingest of probe runs keyed by `run_id`, history, its own `/metrics`. |
+
+```mermaid
+flowchart LR
+    N["nodecheck<br/><i>one-shot</i>"]
+    N -->|"-format prom<br/>textfile"| NE[node_exporter]
+    N -->|"-push-url<br/>JSON batch"| PS["probestore<br/><i>FastAPI + PostgreSQL</i>"]
+    N -->|"stdout JSON<br/>exit code"| CR["cron / CI"]
+    NE --> P[(Prometheus)]
+    PS -->|/metrics| P
+```
 
 ---
 
@@ -73,21 +89,117 @@ nodecheck -targets targets.json -timeout 3s -concurrency 64
 nodecheck -version
 ```
 
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `-targets` | `targets.json` | JSON file listing the nodes |
-| `-timeout` | `5s` | timeout applied to **each phase** separately |
-| `-concurrency` | `32` | maximum probes in flight at once |
-| `-format` | `json` | `json` or `prom` |
-| `-push-url` | — | probestore ingest endpoint; when set, the batch is also stored |
-| `-push-timeout` | `10s` | timeout for the push request |
-| `-push-source` | `nodecheck@<hostname>` | source label recorded with the run |
-| `-version` | | print version and exit |
+| Flag            | Default                | Meaning                                                        |
+| --------------- | ---------------------- | -------------------------------------------------------------- |
+| `-targets`      | `targets.json`         | JSON file listing the nodes                                    |
+| `-timeout`      | `5s`                   | timeout applied to **each phase** separately                   |
+| `-concurrency`  | `32`                   | maximum probes in flight at once                               |
+| `-format`       | `json`                 | `json` or `prom`                                               |
+| `-push-url`     | —                      | probestore ingest endpoint; when set, the batch is also stored |
+| `-push-timeout` | `10s`                  | timeout for the push request                                   |
+| `-push-source`  | `nodecheck@<hostname>` | source label recorded with the run                             |
+| `-version`      |                        | print version and exit                                         |
 
 **Exit codes:** `0` all nodes healthy, `1` at least one node down (or a bad
 targets file), `2` invalid arguments, `3` the push failed. Suitable for cron
 and alerting directly. The last one is deliberately distinct: healthy nodes
 plus a prober that cannot report is a different alert from a node going dark.
+
+### What a run looks like
+
+A reproducible smoke test against public endpoints — no fleet needed, and you
+can run it yourself:
+
+```json
+[
+  {
+    "name": "badsni",
+    "addr": "cloudflare.com:443",
+    "sni": "wrong-sni.invalid",
+    "region": "test",
+    "ok": false,
+    "tcp_ok": true,
+    "tls_ok": false,
+    "ts": "2026-08-07T19:01:11.780604814Z",
+    "tcp_seconds": 0.146483528,
+    "tls_seconds": 0.233876608,
+    "cert_match": false,
+    "error": "tls: remote error: tls: handshake failure"
+  },
+  {
+    "name": "hole",
+    "addr": "192.0.2.1:443",
+    "sni": "example.com",
+    "region": "test",
+    "ok": false,
+    "tcp_ok": true,
+    "tls_ok": false,
+    "ts": "2026-08-07T19:01:16.46606043Z",
+    "tcp_seconds": 0.064490465,
+    "tls_seconds": 5.001585835,
+    "cert_match": false,
+    "error": "tls: context deadline exceeded"
+  },
+  {
+    "name": "live",
+    "addr": "cloudflare.com:443",
+    "sni": "cloudflare.com",
+    "region": "test",
+    "ok": true,
+    "tcp_ok": true,
+    "tls_ok": true,
+    "ts": "2026-08-07T19:01:11.789463776Z",
+    "tcp_seconds": 0.146429082,
+    "tls_seconds": 0.242581506,
+    "tls_version": "1.3",
+    "alpn": "h2",
+    "cert_cn": "cloudflare.com",
+    "cert_match": true
+  }
+]
+```
+
+Three nodes, three different answers. `badsni` is the one worth looking at:
+`tcp_ok` is true and the connect took the same 0.146s as the healthy node — the
+port is open, the route is fine, and by any single-boolean check the node
+passes. The handshake is what says it is not serving what it is supposed to
+serve. `hole` fails differently again, sitting on the phase timeout with an
+error that names which phase gave up.
+
+The whole run finishes in `real 5.072s` — bounded by the slowest target rather
+than the sum of the three — and exits `1`.
+
+The same run in Prometheus text format:
+
+```
+# HELP vpnnode_up Node is reachable (both TCP and TLS succeeded)
+# TYPE vpnnode_up gauge
+vpnnode_up{node="badsni",region="test"} 0
+vpnnode_up{node="hole",region="test"} 0
+vpnnode_up{node="live",region="test"} 1
+# HELP vpnnode_tcp_connect_seconds Time spent on the TCP connect phase
+# TYPE vpnnode_tcp_connect_seconds gauge
+vpnnode_tcp_connect_seconds{node="badsni",region="test"} 0.1857
+vpnnode_tcp_connect_seconds{node="hole",region="test"} 0.1183
+vpnnode_tcp_connect_seconds{node="live",region="test"} 0.1861
+# HELP vpnnode_tls_handshake_seconds Time spent on the TLS handshake phase
+# TYPE vpnnode_tls_handshake_seconds gauge
+vpnnode_tls_handshake_seconds{node="badsni",region="test"} 0.3088
+vpnnode_tls_handshake_seconds{node="hole",region="test"} 5.0013
+vpnnode_tls_handshake_seconds{node="live",region="test"} 0.3321
+# HELP vpnnode_cert_match Presented certificate matches the expected SNI
+# TYPE vpnnode_cert_match gauge
+vpnnode_cert_match{node="badsni",region="test"} 0
+vpnnode_cert_match{node="hole",region="test"} 0
+vpnnode_cert_match{node="live",region="test"} 1
+# HELP vpnnode_initiation_sent A valid protocol initiation was sent and not contradicted; not a liveness signal
+# TYPE vpnnode_initiation_sent gauge
+```
+
+`vpnnode_initiation_sent` is declared and carries no samples: this fleet has no
+`wireguard` targets. Every family is always declared, so the shape of a scrape
+does not change when the composition of the fleet does — a dashboard does not
+break because the last WireGuard node was retired.
 
 ### Target file
 
@@ -124,16 +236,16 @@ WireGuard monitoring key are read from the environment only — a targets file
 gets copied between hosts and committed, and a flag is world-readable through
 `/proc`.
 
-### Probers
+## Probers
 
 A target picks its check with `proto`. Omitting it means `tls` — every targets
 file written before probers existed keeps working untouched.
 
-| `proto` | Phases | What it checks |
-| --- | --- | --- |
-| `tls` (default) | `tcp`, `tls` | TCP connect, then a TLS handshake with the expected SNI |
-| `udp` | `udp`, `response` | sends a datagram, accepts any reply as proof of life |
-| `wireguard` | `udp`, `handshake` | sends a real Noise IK handshake initiation, expects a handshake response |
+| `proto`         | Phases             | What it checks                                                           |
+| --------------- | ------------------ | ------------------------------------------------------------------------ |
+| `tls` (default) | `tcp`, `tls`       | TCP connect, then a TLS handshake with the expected SNI                  |
+| `udp`           | `udp`, `response`  | sends a datagram, accepts any reply as proof of life                     |
+| `wireguard`     | `udp`, `handshake` | sends a real Noise IK handshake initiation, expects a handshake response |
 
 ```json
 [
@@ -148,11 +260,11 @@ file written before probers existed keeps working untouched.
 
 `udp` params — all optional:
 
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `payload` | a single `0x00` byte | bytes to send, as literal text |
-| `payload_hex` | — | the same, hex-encoded, for non-printable payloads |
-| `attempts` | `3` | total datagrams sent before calling the node silent |
+| Field         | Default              | Meaning                                             |
+| ------------- | -------------------- | --------------------------------------------------- |
+| `payload`     | a single `0x00` byte | bytes to send, as literal text                      |
+| `payload_hex` | —                    | the same, hex-encoded, for non-printable payloads   |
+| `attempts`    | `3`                  | total datagrams sent before calling the node silent |
 
 The attempts share the phase timeout rather than multiplying it, and exist
 because UDP drops packets: one lost datagram is not an outage. A definitive
@@ -167,7 +279,7 @@ whether the thing that answered speaks the protocol you expect; that needs a
 real handshake, which is what the `wireguard` prober below does, and what the
 AmneziaWG prober on the roadmap will add for its obfuscated variant.
 
-#### `wireguard`
+### `wireguard`
 
 Builds a genuine WireGuard handshake initiation (Noise IK, message type 1) and
 waits for a handshake response (type 2) that carries our own session index
@@ -181,14 +293,14 @@ WireGuard.
 ```
 
 The key above, and the one in [`examples/targets.json`](examples/targets.json),
-is a placeholder — it decodes to the ASCII text `EXAMPLE-KEY-DO-NOT-USE-IN-PROD!!`
-and belongs to no node. Replace it with the output of `wg show wg0 public-key`
-from the node you are probing.
+is a placeholder — it decodes to the ASCII text
+`EXAMPLE-KEY-DO-NOT-USE-IN-PROD!!` and belongs to no node. Replace it with the
+output of `wg show wg0 public-key` from the node you are probing.
 
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `public_key` | — | the node's static public key, base64 as `wg(8)` prints it. Required |
-| `attempts` | `3` | total initiations sent before calling the node silent |
+| Field             | Default | Meaning                                                                                     |
+| ----------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `public_key`      | —       | the node's static public key, base64 as `wg(8)` prints it. Required                         |
+| `attempts`        | `3`     | total initiations sent before calling the node silent                                       |
 | `allow_anonymous` | `false` | probe without a registered monitoring peer, at the cost of what the result means. See below |
 
 **A `wireguard` target requires a registered monitoring peer.** WireGuard is
@@ -206,7 +318,7 @@ peer on every node in the fleet. One pair covers the whole fleet, and rolling
 it out is a single Ansible task or a line in a Terraform template, but it is
 not zero.
 
-##### Setting up the monitoring peer
+#### Setting up the monitoring peer
 
 On the monitoring host:
 
@@ -238,7 +350,7 @@ AllowedIPs = 10.99.0.254/32
 The private key is read from the environment only, never from a flag or the
 targets file — the same rule as the push token.
 
-##### Reading `wg show` after a probe
+#### Reading `wg show` after a probe
 
 `wg show wg0 latest-handshakes` will keep reporting `0` for the monitoring
 peer, and that is correct. A responder does not consider a session established
@@ -258,7 +370,7 @@ Those 92 bytes are the proof. To send them the node had to verify `mac1`,
 decrypt the initiator's static key, find the peer, and accept the TAI64N
 timestamp — every AEAD tag had to check out.
 
-##### `allow_anonymous`
+#### `allow_anonymous`
 
 For a node where registering a monitoring peer is not possible, set
 `"allow_anonymous": true`. The initiator's key is then generated fresh per
@@ -268,10 +380,10 @@ can claim: a well-formed initiation left the host and nothing contradicted it.
 **Silence passes in this mode**, so the phase is not evidence that the node is
 alive. That is enforced rather than documented: an anonymous target is kept out
 of `vpnnode_up` entirely and reported in
-[`vpnnode_initiation_sent`](#metrics) instead, so no alert built on `vpnnode_up`
-can be fed by it. What the mode still catches is an ICMP port-unreachable
-(nothing is listening) and an answer that is not WireGuard. For real liveness
-on such a node, use a `udp` target instead.
+[`vpnnode_initiation_sent`](#metrics) instead, so no alert built on
+`vpnnode_up` can be fed by it. What the mode still catches is an ICMP
+port-unreachable (nothing is listening) and an answer that is not WireGuard.
+For real liveness on such a node, use a `udp` target instead.
 
 `mac1` is computed properly — without it a responder discards the packet in
 silence. `mac2` and the cookie mechanism are not implemented: a responder under
@@ -300,7 +412,7 @@ reached.
 ## Storing history
 
 A single probe answers *"is the node up right now?"*. Point `-push-url` at a
-[probestore](probestore/) instance and the answers accumulate instead:
+[probestore](probestore) instance and the answers accumulate instead:
 
 ```bash
 export NODECHECK_PUSH_TOKEN=...        # never pass the token as a flag: argv is world-readable
